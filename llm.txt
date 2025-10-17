@@ -1,0 +1,620 @@
+// Cloudflare Worker (Универсальный прокси с fallback-логикой)
+
+const CONFIG = {
+  allowedMethods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedOrigins: ['*'],
+  enableLogging: true,
+};
+
+export default {
+  async fetch(request, env, ctx) {
+    // --- ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ (SECRETS) ---
+    const GCP_PROXY_URL = env.GCP_PROXY_URL;
+    const MASTER_API_KEY = env.MASTER_API_KEY;
+    const NGINX_INTERNAL_SECRET = env.NGINX_INTERNAL_SECRET;
+    // ИЗМЕНЕНИЕ: Добавляем переменную для хоста по умолчанию
+    const DEFAULT_UPSTREAM_HOST = env.DEFAULT_UPSTREAM_HOST;
+    
+    // --- API КЛЮЧИ ПРОВАЙДЕРОВ ---
+    const API_KEYS = {
+      'api.openai.com': env.OPENAI_API_KEY,
+      'generativelanguage.googleapis.com': env.GEMINI_API_KEY,
+      // Добавьте другие хосты и ключи по аналогии
+    };
+
+    if (!GCP_PROXY_URL || !NGINX_INTERNAL_SECRET) {
+      return new Response('Configuration Error: Required environment variables are missing.', { status: 500 });
+    }
+
+    // Обработка CORS preflight
+    if (request.method === 'OPTIONS') {
+      return handleCORS(request);
+    }
+
+    // --- 1. АУТЕНТИКАЦИЯ И ОПРЕДЕЛЕНИЕ ЦЕЛИ ---
+    const clientMasterKey = request.headers.get('X-Master-Key');
+    if (MASTER_API_KEY && clientMasterKey !== MASTER_API_KEY) {
+      return new Response('Unauthorized: Missing or invalid X-Master-Key header.', { status: 401, headers: addCORSHeaders(new Headers(), request.headers.get('Origin')) });
+    }
+    
+    // ИЗМЕНЕНИЕ: Гибкое определение целевого хоста
+    // 1. Проверяем заголовок X-Target-Host (высший приоритет).
+    // 2. Если его нет, используем хост по умолчанию из переменных окружения.
+    let targetHost = request.headers.get('X-Target-Host') || DEFAULT_UPSTREAM_HOST;
+
+    const url = new URL(request.url);
+
+    // Специальная обработка для health-чека
+    if (url.pathname === '/health') {
+      targetHost = new URL(GCP_PROXY_URL).hostname;
+    }
+
+    // ИЗМЕНЕНИЕ: Проверяем, что хост определен (либо из заголовка, либо по умолчанию)
+    if (!targetHost) {
+      return new Response('Bad Request: Target host is not defined. Set X-Target-Host header or configure DEFAULT_UPSTREAM_HOST in Worker settings.', { status: 400, headers: addCORSHeaders(new Headers(), request.headers.get('Origin')) });
+    }
+    
+    if (CONFIG.enableLogging) {
+      const source = request.headers.get('X-Target-Host') ? 'Header' : 'Default';
+      console.log(`[${new Date().toISOString()}] ${request.method} ${url.pathname} -> ${targetHost} (Source: ${source})`);
+    }
+
+    // --- 2. ПОДГОТОВКА ЗАГОЛОВКОВ ДЛЯ NGINX ---
+    const headers = new Headers(request.headers);
+    
+    headers.delete('X-Master-Key');
+    headers.delete('X-Target-Host');
+    
+    headers.set('X-Worker-Auth', NGINX_INTERNAL_SECRET);
+    headers.set('X-Proxy-Target', targetHost);
+    
+    if (!headers.has('Authorization') && API_KEYS[targetHost]) {
+      headers.set('Authorization', `Bearer ${API_KEYS[targetHost]}`);
+    }
+
+    // --- 3. ВЫПОЛНЯЕМ ЗАПРОС К ПРОКСИ (NGINX) ---
+    const proxyUrl = `${GCP_PROXY_URL}${url.pathname}${url.search}`;
+    
+    try {
+      const proxyResponse = await fetch(proxyUrl, {
+        method: request.method,
+        headers: headers,
+        body: request.body,
+        redirect: 'follow',
+      });
+
+      // --- 4. ПОДГОТОВКА ОТВЕТА КЛИЕНТУ ---
+      const responseHeaders = new Headers(proxyResponse.headers);
+      addCORSHeaders(responseHeaders, request.headers.get('Origin'));
+      responseHeaders.set('X-Proxy-Via', 'CF-Worker-Universal-Fallback');
+      responseHeaders.set('X-Proxy-Target', targetHost);
+
+      return new Response(proxyResponse.body, {
+        status: proxyResponse.status,
+        statusText: proxyResponse.statusText,
+        headers: responseHeaders,
+      });
+
+    } catch (error) {
+      console.error(`Fatal error:`, error.message);
+      const errorHeaders = new Headers({ 'Content-Type': 'application/json' });
+      addCORSHeaders(errorHeaders, request.headers.get('Origin'));
+      
+      return new Response(JSON.stringify({ error: 'Proxy Error', message: error.message }), { 
+        status: 502, 
+        headers: errorHeaders 
+      });
+    }
+  },
+};
+
+// Вспомогательные функции CORS (без изменений)
+function isOriginAllowed(requestOrigin) {
+  if (!requestOrigin) return CONFIG.allowedOrigins.includes('*');
+  return CONFIG.allowedOrigins.includes('*') || CONFIG.allowedOrigins.includes(requestOrigin);
+}
+function handleCORS(request) {
+  const requestOrigin = request.headers.get('Origin');
+  if (!isOriginAllowed(requestOrigin)) return new Response('CORS Forbidden', { status: 403 });
+  const headers = new Headers();
+  headers.set('Access-Control-Allow-Origin', requestOrigin || '*');
+  headers.set('Access-Control-Allow-Methods', CONFIG.allowedMethods.join(', '));
+  headers.set('Access-Control-Max-Age', '86400');
+  const requestedHeaders = request.headers.get('Access-Control-Request-Headers');
+  headers.set('Access-Control-Allow-Headers', requestedHeaders || 'Content-Type, Authorization, X-Master-Key, X-Target-Host');
+  return new Response(null, { status: 204, headers });
+}
+function addCORSHeaders(headers, requestOrigin) {
+  if (isOriginAllowed(requestOrigin)) {
+    headers.set('Access-Control-Allow-Origin', requestOrigin || '*');
+  }
+  return headers;
+}
+
+// Cloudflare Worker: OpenAI-to-Gemini Connector v2.1
+// Интегрирован с Nginx прокси и поддерживает эндпоинты /models, /chat/completions, /embeddings
+
+// --- Вспомогательные классы и функции ---
+
+class HttpError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = this.constructor.name;
+    this.status = status;
+  }
+}
+
+const fixCors = ({ headers, status, statusText }) => {
+  headers = new Headers(headers);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Master-Key, x-goog-api-key");
+  return { headers, status, statusText };
+};
+
+const assert = (success) => {
+  if (!success) {
+    throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
+  }
+};
+
+const generateId = () => {
+  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
+  return Array.from({ length: 29 }, randomChar).join("");
+};
+
+// --- Функция для перенаправления запросов через Nginx ---
+
+async function forwardToNginxProxy(url, options = {}, env) {
+  const { GCP_PROXY_URL, NGINX_INTERNAL_SECRET } = env;
+
+  if (!GCP_PROXY_URL || !NGINX_INTERNAL_SECRET) {
+    throw new HttpError("Proxy configuration error: GCP_PROXY_URL or NGINX_INTERNAL_SECRET is not set.", 500);
+  }
+
+  const targetUrl = new URL(url);
+  const proxyTargetHost = targetUrl.hostname;
+  const nginxUrl = `${GCP_PROXY_URL}${targetUrl.pathname}${targetUrl.search}`;
+
+  const newHeaders = new Headers(options.headers);
+  newHeaders.set('X-Proxy-Target', proxyTargetHost);
+  newHeaders.set('X-Worker-Auth', NGINX_INTERNAL_SECRET);
+
+  const newOptions = { ...options, headers: newHeaders };
+
+  return fetch(nginxUrl, newOptions);
+}
+
+// --- Функции-трансформеры ---
+
+const makeGoogleHeaders = (googleApiKey, more) => {
+  const headers = new Headers(more);
+  headers.set("x-goog-api-client", "genai-js/0.21.0");
+  if (googleApiKey) {
+    headers.set("x-goog-api-key", googleApiKey);
+  }
+  return headers;
+};
+
+const harmCategory = [
+    "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+    "HARM_CATEGORY_DANGEROUS_CONTENT", "HARM_CATEGORY_HARASSMENT"
+];
+const safetySettings = harmCategory.map((category) => ({ category, threshold: "BLOCK_NONE" }));
+
+const fieldsMap = {
+    frequency_penalty: "frequencyPenalty", max_tokens: "maxOutputTokens", n: "candidateCount",
+    presence_penalty: "presencePenalty", seed: "seed", stop: "stopSequences",
+    temperature: "temperature", top_k: "topK", top_p: "topP"
+};
+
+const adjustProps = (schemaPart) => {
+    if (typeof schemaPart !== "object" || schemaPart === null) return;
+    if (Array.isArray(schemaPart)) {
+        schemaPart.forEach(adjustProps);
+    } else {
+        delete schemaPart.$schema;
+        delete schemaPart.additionalProperties;
+        delete schemaPart.strict;
+        Object.values(schemaPart).forEach(adjustProps);
+    }
+};
+
+const adjustSchema = (schema) => {
+    adjustProps(schema);
+    return schema;
+};
+
+const transformConfig = (req) => {
+    let cfg = {};
+    for (let key in req) {
+        const matchedKey = fieldsMap[key];
+        if (matchedKey) cfg[matchedKey] = req[key];
+    }
+    if (req.response_format?.type === "json_object") {
+        cfg.responseMimeType = "application/json";
+    }
+    return cfg;
+};
+
+const parseImg = async (url, env) => {
+    let mimeType, data;
+    if (url.startsWith("http")) {
+        const response = await forwardToNginxProxy(url, {}, env);
+        if (!response.ok) throw new Error(`Image fetch failed: ${response.status}`);
+        mimeType = response.headers.get("content-type") || "application/octet-stream";
+        data = btoa(String.fromCharCode(...new Uint8Array(await response.arrayBuffer())));
+    } else {
+        const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
+        if (!match?.groups) throw new HttpError("Invalid image data", 400);
+        ({ mimeType, data } = match.groups);
+    }
+    return { inlineData: { mimeType, data } };
+};
+
+const transformMsg = async (item, env) => {
+    if (typeof item.content === "string") return [{ text: item.content }];
+    const parts = [];
+    for (const sub of item.content) {
+        if (sub.type === "text") parts.push({ text: sub.text });
+        if (sub.type === "image_url") parts.push(await parseImg(sub.image_url.url, env));
+    }
+    return parts;
+};
+
+const transformMessages = async (messages, env) => {
+    const contents = [];
+    let system_instruction;
+    for (const item of messages) {
+        switch (item.role) {
+            case "system":
+                system_instruction = { parts: await transformMsg(item, env) };
+                continue;
+            case "assistant":
+                item.role = "model";
+                break;
+            case "user": break;
+            default: throw new HttpError(`Unknown role: ${item.role}`, 400);
+        }
+        contents.push({ role: item.role, parts: await transformMsg(item, env) });
+    }
+    return { contents, system_instruction };
+};
+
+const transformTools = (req) => {
+    let tools;
+    const declarations = [];
+
+    if (req.tools) {
+        const funcs = req.tools.filter(tool => tool.type === "function");
+        if (funcs.length > 0) {
+            funcs.forEach(adjustSchema);
+            declarations.push({ function_declarations: funcs.map(f => f.function) });
+        }
+    }
+
+    if (req.use_grounding === true) {
+        declarations.push({ "googleSearch": {} });
+        delete req.use_grounding;
+    }
+
+    if (declarations.length > 0) {
+        tools = declarations;
+    }
+    
+    let tool_config;
+    // Note: tool_choice logic can be expanded here if needed
+    
+    return { tools, tool_config };
+};
+
+const transformRequest = async (req, env) => ({
+    ...await transformMessages(req.messages, env),
+    safetySettings,
+    generationConfig: transformConfig(req),
+    ...transformTools(req),
+});
+
+const transformCandidates = (key, cand) => {
+    const message = { role: "assistant", content: null };
+    if (cand.content?.parts) {
+      const texts = [];
+      for (const part of cand.content.parts) {
+        if (part.text) texts.push(part.text);
+        if (part.functionCall) {
+          message.tool_calls = message.tool_calls || [];
+          message.tool_calls.push({
+            id: `call_${generateId()}`, type: "function",
+            function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args) }
+          });
+        }
+      }
+      if(texts.length > 0) message.content = texts.join('');
+    }
+    const finishReasonMap = {
+        "STOP": "stop",
+        "MAX_TOKENS": "length",
+        "SAFETY": "content_filter",
+        "RECITATION": "content_filter",
+    };
+    return {
+        index: cand.index || 0,
+        [key]: message,
+        finish_reason: message.tool_calls ? "tool_calls" : (finishReasonMap[cand.finishReason] || cand.finishReason?.toLowerCase())
+    };
+};
+const transformCandidatesMessage = transformCandidates.bind(null, "message");
+
+const processCompletionsResponse = (data, model) => {
+    const obj = {
+        id: "chatcmpl-" + generateId(),
+        choices: (data.candidates || []).map(transformCandidatesMessage),
+        created: Math.floor(Date.now() / 1000),
+        model, object: "chat.completion",
+    };
+    if (data.usageMetadata) {
+        obj.usage = {
+            completion_tokens: data.usageMetadata.candidatesTokenCount,
+            prompt_tokens: data.usageMetadata.promptTokenCount,
+            total_tokens: data.usageMetadata.totalTokenCount
+        };
+    }
+    return JSON.stringify(obj);
+};
+
+// --- Основные обработчики эндпоинтов ---
+
+async function handleModels(env) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models`;
+    const response = await forwardToNginxProxy(url, { headers: makeGoogleHeaders(env.GOOGLE_API_KEY) }, env);
+    
+    if (!response.ok) return new Response(response.body, fixCors(response));
+    
+    const { models } = await response.json();
+    const body = JSON.stringify({
+        object: "list",
+        data: models.map(({ name }) => ({ id: name.replace("models/", ""), object: "model", created: 0, owned_by: "google" }))
+    });
+    return new Response(body, fixCors(response));
+}
+
+async function handleCompletions(req, env) {
+    let model = req.model || "gemini-1.5-flash-latest";
+    model = model.replace(/^models\//, "");
+
+    const body = await transformRequest(req, env);
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+    const response = await forwardToNginxProxy(url, {
+        method: "POST",
+        headers: makeGoogleHeaders(env.GOOGLE_API_KEY, { "Content-Type": "application/json" }),
+        body: JSON.stringify(body)
+    }, env);
+
+    if (!response.ok) return new Response(response.body, fixCors(response));
+
+    const responseBody = processCompletionsResponse(await response.json(), model);
+    return new Response(responseBody, fixCors(response));
+}
+
+async function handleEmbeddings(req, env) {
+    const model = req.model || "text-embedding-004";
+    const inputs = Array.isArray(req.input) ? req.input : [req.input];
+
+    const body = {
+      requests: inputs.map(text => ({
+        model: `models/${model}`,
+        content: { parts: [{ text }] }
+      }))
+    };
+    
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents`;
+
+    const response = await forwardToNginxProxy(url, {
+        method: "POST",
+        headers: makeGoogleHeaders(env.GOOGLE_API_KEY, { "Content-Type": "application/json" }),
+        body: JSON.stringify(body)
+    }, env);
+
+    if (!response.ok) return new Response(response.body, fixCors(response));
+
+    const { embeddings } = await response.json();
+    const responseBody = JSON.stringify({
+      object: "list",
+      data: embeddings.map(({ values }, index) => ({
+        object: "embedding",
+        index,
+        embedding: values
+      })),
+      model,
+      usage: {
+        prompt_tokens: 0, // Gemini API doesn't provide token usage for embeddings
+        total_tokens: 0
+      }
+    });
+    return new Response(responseBody, fixCors(response));
+}
+
+// --- Главный обработчик Worker'а ---
+
+export default {
+    async fetch(request, env) {
+        const ts = new Date().toISOString();
+        const logPrefix = `[GEMINI-CONNECTOR][${ts}]`;
+
+        // 1. Аутентификация
+        const clientMasterKey = request.headers.get('X-Master-Key');
+        if (!env.MASTER_API_KEY || clientMasterKey !== env.MASTER_API_KEY) {
+            console.log(`${logPrefix}[AUTH_FAIL] Unauthorized: Invalid X-Master-Key.`);
+            return new Response('Unauthorized: Missing or invalid X-Master-Key for proxy.', { status: 401 });
+        }
+        console.log(`${logPrefix}[AUTH_SUCCESS] Proxy Authorization successful via X-Master-Key.`);
+
+        // 2. Обработка CORS
+        if (request.method === "OPTIONS") {
+            return new Response(null, fixCors({ headers: new Headers() }));
+        }
+
+        const errHandler = (err) => {
+            console.error(`${logPrefix}[ERROR]`, err);
+            return new Response(err.message, fixCors({ status: err.status ?? 500 }));
+        };
+
+        // 3. Маршрутизация запроса
+        try {
+            const { pathname } = new URL(request.url);
+            console.log(`${logPrefix}[REQUEST_IN] Path: ${pathname}`);
+
+            switch (true) {
+                case pathname.endsWith("/chat/completions"):
+                    assert(request.method === "POST");
+                    return handleCompletions(await request.json(), env).catch(errHandler);
+                
+                case pathname.endsWith("/models"):
+                    assert(request.method === "GET");
+                    return handleModels(env).catch(errHandler);
+                
+                case pathname.endsWith("/embeddings"):
+                    assert(request.method === "POST");
+                    return handleEmbeddings(await request.json(), env).catch(errHandler);
+                
+                default:
+                    throw new HttpError(`Not Found: The requested endpoint does not exist.`, 404);
+            }
+        } catch (err) {
+            return errHandler(err);
+        }
+    }
+};
+
+# docker-compose.yml
+
+services:
+  nginx:
+    # Собираем образ из нашего Dockerfile
+    build: ./nginx
+    container_name: universal-nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/logs:/var/log/nginx
+    # Передаем секрет из .env файла в контейнер Nginx
+    env_file:
+      - .env
+    networks:
+      - proxy_network
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: tunnel --no-autoupdate --protocol http2 run --token ${CLOUDFLARED_TOKEN}
+    depends_on:
+      - nginx
+    networks:
+      - proxy_network
+
+networks:
+  proxy_network:
+    driver: bridge
+	
+	
+# nginx/Dockerfile
+
+# Используем alpine-версию Nginx
+FROM nginx:alpine
+
+# Устанавливаем gettext для утилиты envsubst
+RUN apk add --no-cache gettext
+
+# Копируем шаблон конфигурации
+COPY nginx.conf.template /etc/nginx/nginx.conf.template
+
+# Копируем скрипт запуска
+COPY entrypoint.sh /docker-entrypoint.d/20-envsubst-on-templates.sh
+
+# Даем права на выполнение
+RUN chmod +x /docker-entrypoint.d/20-envsubst-on-templates.sh
+
+#!/bin/sh
+# nginx/entrypoint.sh
+
+set -e
+
+# Подставляем переменные окружения в шаблон и создаем финальный конфиг
+envsubst '${NGINX_INTERNAL_SECRET}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+
+exit 0
+
+# nginx/nginx.conf.template
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    resolver 127.0.0.11 valid=30s;
+    map_hash_bucket_size 128;
+
+    # Секрет будет подставлен из переменной окружения NGINX_INTERNAL_SECRET
+    map $http_x_worker_auth $auth_status {
+        "${NGINX_INTERNAL_SECRET}" 1;
+        default 0;
+    }
+
+    log_format main '$remote_addr - [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" target="$http_x_proxy_target"';
+
+    access_log /var/log/nginx/access.log main;
+    error_log /var/log/nginx/error.log warn;
+
+    # --- Настройки таймаутов и буферизации ---
+    proxy_connect_timeout 60s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    client_max_body_size 20M;
+    proxy_buffering off;
+    proxy_request_buffering off;
+
+    server {
+        listen 8080;
+        server_name _;
+
+        location /health {
+            access_log off;
+            return 200 "OK\n";
+        }
+
+        location / {
+            # 1. Проверка секрета от Worker
+            if ($auth_status = 0) {
+                return 403 "Forbidden: Invalid Worker Secret";
+            }
+            
+            # 2. Проверка целевого хоста от Worker
+            set $proxy_host $http_x_proxy_target;
+            if ($proxy_host = "") {
+                 return 400 "Bad Request: X-Proxy-Target header not set by Worker";
+            }
+
+            # 3. Динамическое проксирование
+            proxy_set_header Host $proxy_host;
+            proxy_ssl_server_name on;
+            proxy_ssl_name $proxy_host;
+            proxy_pass https://$proxy_host$request_uri;
+
+            # 4. Прочие заголовки
+            proxy_http_version 1.1;
+            proxy_set_header Connection "";
+            proxy_pass_request_headers on;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
