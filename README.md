@@ -7,7 +7,7 @@
 
 Запрос проходит через несколько этапов, обеспечивающих безопасность, универсальность и логирование:
 
-`Клиент` -> `Cloudflare Worker` -> `Cloudflare Tunnel` -> `Nginx (Docker)` -> `Целевой AI API`
+`Клиент` ➡️ `Cloudflare Worker` ➡️ `Cloudflare Tunnel` ➡️ `Nginx (Docker)` ➡️ `Целевой AI API`
 
 1.  **Cloudflare Worker**: Точка входа. Аутентифицирует запросы, определяет целевой API, добавляет необходимые заголовки и направляет запрос в туннель.
 2.  **Cloudflare Tunnel**: Создает зашифрованный и стабильный туннель от сети Cloudflare до вашего Docker-контейнера, избавляя от необходимости иметь статический IP и открывать порты.
@@ -28,12 +28,12 @@
 
 ```
 .
-├── docker-compose.yml      # Файл для оркестрации Docker-контейнеров
-├── .env                    # Файл с вашими секретами и токенами
+├── docker-compose.yml
+├── .env
 └── nginx/
-    ├── Dockerfile          # Создает кастомный образ Nginx с поддержкой переменных окружения
-    ├── entrypoint.sh       # Скрипт, который подставляет секрет в конфиг Nginx при старте
-    └── nginx.conf.template # Шаблон конфигурации Nginx
+    ├── Dockerfile
+    ├── entrypoint.sh
+    └── nginx.conf.template
 ```
 
 ## Установка и развертывание
@@ -59,10 +59,12 @@
 
 ### Шаг 3: Настройка бэкенда
 
-1.  Клонируйте этот репозиторий или создайте файлы и папки согласно структуре выше.
+1.  Создайте файлы и папки согласно структуре, указанной выше.
 2.  Создайте файл `.env` в корне проекта и заполните его:
 
     ```dotenv
+    # .env
+
     # Токен из дашборда Cloudflare Tunnels
     CLOUDFLARED_TOKEN=ВАШ_СКОПИРОВАННЫЙ_ТОКЕН
 
@@ -78,55 +80,70 @@
 
 ### Шаг 4: Развертывание Cloudflare Workers
 
-Вам нужно создать два Worker'а.
+Вам нужно создать два Worker'а и скопировать в них соответствующий код.
 
 #### 1. Универсальный прокси (`proxy.your-domain.com`)
 
-1.  В Cloudflare перейдите в `Workers & Pages` -> `Create application` -> `Create Worker`.
-2.  Дайте ему имя (например, `universal-proxy`) и разверните.
-3.  Скопируйте в него код из файла `universal-proxy.js`.
-4.  Перейдите в `Settings` -> `Variables` и добавьте **Environment Variables**:
+1.  Создайте Worker в дашборде Cloudflare.
+2.  Перейдите в `Settings` -> `Variables` и добавьте **Environment Variables**:
     *   `GCP_PROXY_URL` (Plain Text): `https://proxy.your-domain.com` (URL вашего туннеля)
     *   `DEFAULT_UPSTREAM_HOST` (Plain Text): `api.openai.com` (Хост для n8n)
     *   `MASTER_API_KEY` (Secret): Ваш главный ключ доступа к прокси.
     *   `NGINX_INTERNAL_SECRET` (Secret): Тот же секрет, что и в `.env` файле.
-5.  Перейдите во вкладку `Triggers` и привяжите Worker к вашему маршруту (`proxy.your-domain.com/*`).
+3.  Перейдите во вкладку `Triggers` и привяжите Worker к вашему маршруту (например, `proxy.your-domain.com/*`).
 
 #### 2. Коннектор OpenAI-to-Gemini (`gemini.your-domain.com`)
 
-1.  Создайте еще один Worker (например, `gemini-connector`).
-2.  Скопируйте в него код из файла `gemini-connector.js`.
-3.  Настройте его переменные окружения:
+1.  Создайте второй Worker.
+2.  Настройте его переменные окружения:
     *   `GCP_PROXY_URL` (Plain Text): `https://proxy.your-domain.com`
     *   `MASTER_API_KEY` (Secret): Ваш главный ключ доступа.
     *   `NGINX_INTERNAL_SECRET` (Secret): Тот же секрет, что и в `.env`.
     *   `GOOGLE_API_KEY` (Secret): Ваш API-ключ от Google AI Studio.
-4.  Привяжите его к другому маршруту (например, `gemini.your-domain.com/*`).
+3.  Привяжите его к другому маршруту (например, `gemini.your-domain.com/*`).
 
 ## Использование
 
-### Универсальный прокси
+### 1. Универсальный прокси
 
 **Запрос на хост по умолчанию (OpenAI):**
 ```bash
 curl https://proxy.your-domain.com/v1/chat/completions \
+  -H "Content-Type: application/json" \
   -H "Authorization: Bearer $OPENAI_API_KEY" \
   -H "X-Master-Key: $MASTER_API_KEY" \
-  -d '{"model": "gpt-4o", "messages": [{"role":"user", "content":"Hello"}]}'
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role":"user", "content":"Hello"}]
+  }'
 ```
 
-**Запрос на произвольный хост (Anthropic):**```bash
+**Запрос на произвольный хост (Anthropic):**
+```bash
 curl https://proxy.your-domain.com/v1/messages \
+  -H "Content-Type: application/json" \
   -H "x-api-key: $ANTHROPIC_API_KEY" \
   -H "X-Master-Key: $MASTER_API_KEY" \
   -H "X-Target-Host: api.anthropic.com" \
   -H "anthropic-version: 2023-06-01" \
-  -d '{"model": "claude-3-opus-20240229", "messages": [{"role":"user", "content":"Hello"}], "max_tokens": 100}'
+  -d '{
+    "model": "claude-3-opus-20240229",
+    "messages": [{"role":"user", "content":"Hello"}],
+    "max_tokens": 100
+  }'
 ```
 
-### Gemini-коннектор
+### 2. Gemini-коннектор
 
 Используйте стандартный формат OpenAI, коннектор все преобразует сам.
+
+**Получение списка моделей Gemini:**
+```bash
+curl https://gemini.your-domain.com/v1/models \
+  -H "X-Master-Key: $MASTER_API_KEY"
+```
+
+**Запрос к чату Gemini:**
 ```bash
 curl https://gemini.your-domain.com/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -139,3 +156,4 @@ curl https://gemini.your-domain.com/v1/chat/completions \
   }'
 ```
 
+```
