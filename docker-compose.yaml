@@ -1,0 +1,33 @@
+# docker-compose.yml
+
+services:
+  nginx:
+    # Собираем образ из нашего Dockerfile
+    build: ./nginx
+    container_name: universal-nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/logs:/var/log/nginx
+    # Передаем секрет из .env файла в контейнер Nginx
+    env_file:
+      - .env
+    networks:
+      - proxy_network
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: tunnel --no-autoupdate --protocol http2 run --token ${CLOUDFLARED_TOKEN}
+    depends_on:
+      - nginx
+    networks:
+      - proxy_network
+
+networks:
+  proxy_network:
+    driver: bridge

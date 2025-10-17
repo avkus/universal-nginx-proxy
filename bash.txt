@@ -1,0 +1,18 @@
+# Клонируйте или создайте файлы
+mkdir openai-proxy && cd openai-proxy
+# Создайте .env, nginx.conf, docker-compose.yml (как выше)
+nano .env
+nano nginx.conf
+nano docker-compose.yml
+
+# Создайте папку для логов
+mkdir logs
+
+# Запустите
+docker compose up -d
+
+# Чтение секрета из .env
+INTERNAL_SECRET=$(grep NGINX_INTERNAL_SECRET .env | cut -d '=' -f 2)
+
+# Вставка секрета в nginx.conf (используется sed для замены)
+sed -i "s|__NGINX_INTERNAL_SECRET_PLACEHOLDER__|$INTERNAL_SECRET|g" nginx.conf
