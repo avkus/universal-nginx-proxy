@@ -1,5 +1,3 @@
-# nginx/nginx.conf.template
-
 events {
     worker_connections 1024;
 }
@@ -8,61 +6,51 @@ http {
     resolver 127.0.0.11 valid=30s;
     map_hash_bucket_size 128;
 
-    # Секрет будет подставлен из переменной окружения NGINX_INTERNAL_SECRET
-    map $http_x_worker_auth $auth_status {
-        "${NGINX_INTERNAL_SECRET}" 1;
+    # Простая проверка одного заголовка
+    map $http_x_master_key $auth_status {
+        "${MASTER_API_KEY}" 1;
         default 0;
+    }
     }
 
     log_format main '$remote_addr - [$time_local] "$request" '
-                    '$status $body_bytes_sent "$http_referer" '
-                    '"$http_user_agent" target="$http_x_proxy_target"';
+                    '$status target="$http_x_proxy_target"';
 
     access_log /var/log/nginx/access.log main;
     error_log /var/log/nginx/error.log warn;
 
-    # --- Настройки таймаутов и буферизации ---
     proxy_connect_timeout 60s;
     proxy_send_timeout 300s;
     proxy_read_timeout 300s;
     client_max_body_size 20M;
     proxy_buffering off;
-    proxy_request_buffering off;
 
     server {
         listen 8080;
-        server_name _;
 
         location /health {
-            access_log off;
             return 200 "OK\n";
         }
 
         location / {
-            # 1. Проверка секрета от Worker
-            if ($auth_status = 0) {
-                return 403 "Forbidden: Invalid Worker Secret";
-            }
+        # 1. Проверка секрета
+        if ($auth_status = 0) {
+            return 403 "Forbidden: Invalid Master Key";
+        }
             
-            # 2. Проверка целевого хоста от Worker
             set $proxy_host $http_x_proxy_target;
             if ($proxy_host = "") {
-                 return 400 "Bad Request: X-Proxy-Target header not set by Worker";
+                return 400 "Bad Request";
             }
 
-            # 3. Динамическое проксирование
             proxy_set_header Host $proxy_host;
             proxy_ssl_server_name on;
             proxy_ssl_name $proxy_host;
             proxy_pass https://$proxy_host$request_uri;
 
-            # 4. Прочие заголовки
             proxy_http_version 1.1;
             proxy_set_header Connection "";
             proxy_pass_request_headers on;
-            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-            proxy_set_header X-Real-IP $remote_addr;
-            proxy_set_header X-Forwarded-Proto $scheme;
         }
     }
 }

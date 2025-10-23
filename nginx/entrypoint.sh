@@ -1,9 +1,10 @@
 #!/bin/sh
-# nginx/entrypoint.sh
+# nginx/entrypoint.sh (ИСПРАВЛЕННЫЙ)
 
 set -e
 
-# Подставляем переменные окружения в шаблон и создаем финальный конфиг
-envsubst '${NGINX_INTERNAL_SECRET}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
+# Подставляем ОДНУ переменную в шаблон
+envsubst '${MASTER_API_KEY}' < /etc/nginx/nginx.conf.template > /etc/nginx/nginx.conf
 
-exit 0
+# Запускаем nginx в foreground
+exec nginx -g "daemon off;"
